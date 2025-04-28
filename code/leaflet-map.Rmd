@@ -1,0 +1,137 @@
+---
+title: "analysis-md"
+author: "Radwa"
+date: "2025-04-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(dplyr,
+               ggplot2,
+               forcats,
+               sf,
+               units,
+               spatstat,
+               spatstat.geom,
+               spdep,
+               hms,
+               lubridate,
+               leaflet,
+               mapview,
+               showtext)
+
+
+outlets <- st_read("../data/gis_osm_pois_free_1.shp") |> filter(fclass == "nightclub" | fclass == "bar" | fclass == "pub")|>
+  st_transform(4326) |> select(fclass, geometry) 
+
+clubs <- st_read("../data/nightclubs.shp") |> select(fclass, geometry) |> st_transform(4326) 
+
+outlets <- rbind(outlets, clubs) |>  distinct(geometry, .keep_all = TRUE) |> st_transform(32633) 
+
+
+berlin_boroughs <- st_read("../data/berlin_bezirke.gpkg", quiet = TRUE) 
+bbox_map <- st_bbox(berlin_boroughs) 
+
+crimes <- st_read("../data/crimes.shp") |> rename(report_id = reprt_d, crim_cat = crm_ctg, crim_loc = crm_lct ) |>
+  select(report_id, crim_cat, crim_dt, crim_tm, crim_loc, geometry)
+
+crimes <- st_transform(crimes, crs = st_crs(berlin_boroughs)) 
+crimes  <-  st_crop(crimes , bbox_map) 
+crimes <- st_transform(crimes, crs = st_crs(outlets))
+# ------------------------ ncross analysis ---------------------------
+
+outlets_coords <- st_coordinates(outlets)  # extract coords from outlets_sf
+crimes_coords <- st_coordinates(crimes)   # extract coords from crimes_sf
+head(outlets_coords) # just for inspection
+
+
+window <- owin(xrange = range(c(outlets_coords[, 1], crimes_coords[, 1])),
+                      yrange = range(c(outlets_coords[, 2], crimes_coords[, 2]))) # create a window based on both sf data coords
+
+
+outlets_ppp <- ppp(x = outlets_coords[, 1], y = outlets_coords[, 2], window = window) # outlets ppp type object for nncross 
+crimes_ppp <- ppp(x = crimes_coords[, 1], y = crimes_coords[, 2], window = window) # crimes ppp type object for nncross 
+
+
+nn_dist <- nncross(crimes_ppp, outlets_ppp, k =1) # calculate  crime is main var of interest. Q Are crimes happening near outelts?
+
+mean_dist <-  mean(nn_dist$dist)
+cat("Average Distance between Crimes and Outlets" , round(mean_dist, 0), "meters")
+
+distances <- nn_dist$dist
+summary(distances) # summary stats
+
+
+#--------------------  analysis for selected distance 10 -300  --------------
+
+min_dist <- 10
+max_dist <- 200
+
+nearest_outlets <- nn_dist$which
+
+valid_indices <- which(distances >= min_dist & distances <= max_dist) # filter distances within boundary
+
+crimes_neigboured <- crimes[valid_indices, ] 
+crimes_neigboured_coords <- st_coordinates(crimes_neigboured)# filter crime coords matrix based on distance boundaries
+# outlets_coords #  we already have it
+
+nearest_outlets_coords <- outlets_coords[nearest_outlets[valid_indices], ] # filter close outlets within boundaries
+
+
+edges_list <- lapply(seq_len(nrow(crimes_neigboured_coords)), function(i) {
+  st_linestring(rbind(crimes_neigboured_coords[i, ], nearest_outlets_coords[i, ])) # create line string between the filtered point feature
+})
+
+
+edges_sf <- st_sf(geometry = st_sfc(edges_list), distance = distances[valid_indices], crs = st_crs(crimes)) # transform edges to sf obj
+
+
+crime_perc <- (nrow(crimes_neigboured) / nrow(crimes)) * 100 # percentage of crimes within 10 to 200 m distance to outlets
+
+
+# change crs for map plot
+crimes  <- st_transform(crimes, 4326)
+outlets <- st_transform(outlets, 4326)
+edges_sf <- st_transform(edges_sf, 4326)
+
+
+# leaflet map crime_outlet_map 
+ leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>% # base map - googlemaps
+  addCircleMarkers(
+    data = outlets,
+    color = "blue",
+    radius = 3,
+    label = ~ fclass,
+    group = "Outlets",
+    fillOpacity = 0.7,
+    stroke = FALSE) %>%
+  addCircleMarkers(
+    data = crimes,
+                   color = "red", radius = 3,
+                   label = ~crim_cat, group = "Crimes",
+                   fillOpacity = 0.7, stroke = FALSE) %>% 
+  addPolylines( data = edges_sf,
+    color = "purple",
+    weight = 2,
+    opacity = 0.7,
+    group = "Connections") %>%
+  addLayersControl(
+    overlayGroups = c("Outlets", "Crimes", "Connections"),
+    options = layersControlOptions(collapsed = FALSE)) %>%
+  addControl(html = sprintf("<strong>Nearest Neighbor Connections<br>10–300m</strong>", crime_perc),
+    position = "topright") %>% 
+  addLegend(
+    position = "bottomright", 
+    colors = c("red", "blue", "purple"),  
+    labels = c("Crime", "Outlet", "Unweighted edges"),  
+    title = "Feature type",  
+    opacity = 1) 
+
+```
+
